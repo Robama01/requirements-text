@@ -1,0 +1,377 @@
+import asyncio
+import os
+import logging
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from deriv_api import DerivAPI
+
+# ================== CONFIGURATION ==================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")        # token Telegram
+AUTHORIZED_USERS = [int(x.strip()) for x in os.getenv("AUTHORIZED_USERS", "").split(",") if x.strip()]
+DERIV_APP_ID = os.getenv("DERIV_APP_ID")            # ex: "1089"
+DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")      # ton token PAT
+SYMBOL = "frxEURUSD"                                # symbole Forex sur Deriv
+RSI_PERIOD = 14
+DEFAULT_STAKE = 10.0                                # montant en USD (multiplicateur)
+# Le multiplicateur sera appliqué implicitement, on peut fixer un effet de levier via le stake
+SL_MULTIPLIER_PCT = 0.05                            # 5% du prix (ex: pour EURUSD ~1.05, SL=0.0005*10000=5 pips)
+TP_MULTIPLIER_PCT = 0.10                            # 10% du prix
+# Pour le Multiplier, SL et TP sont des niveaux de prix absolus.
+# On va les calculer à l'entrée en fonction du prix actuel.
+
+# ====================================================
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Variables globales
+ai_running = False
+ai_task = None
+deriv_api = None
+prices_buffer = []  # stockage des derniers prix (tick)
+
+# ================== CONNEXION DERIV ==================
+async def connect_deriv():
+    """Initialise la connexion WebSocket et autorise le compte."""
+    global deriv_api
+    try:
+        deriv_api = DerivAPI(app_id=DERIV_APP_ID)
+        # Envoyer l'autorisation avec le token
+        response = await deriv_api.authorize(DERIV_API_TOKEN)
+        logger.info(f"✅ Connecté à Deriv : {response.get('authorize', {}).get('loginid', 'inconnu')}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Échec connexion Deriv : {e}")
+        return False
+
+# ================== SOUSCRIPTION AUX PRIX ============
+async def subscribe_to_ticks(symbol):
+    """Souscrire aux ticks d'un symbole pour remplir le buffer de prix."""
+    try:
+        # Souscrire aux ticks
+        source = await deriv_api.subscribe({"ticks": symbol})
+        async for tick in source:
+            if 'tick' in tick and 'quote' in tick['tick']:
+                price = tick['tick']['quote']
+                # Pour Forex, on utilise le prix 'mid' (quote) ou le dernier prix "ask/bid" ?
+                # Pour un Multiplier, le prix d'entrée est basé sur le spot (mid).
+                # On stocke le prix dans le buffer.
+                prices_buffer.append(price)
+                # Limiter la taille du buffer pour le RSI
+                if len(prices_buffer) > 200:
+                    prices_buffer.pop(0)
+                # Optionnel : envoyer un log à Telegram (à éviter, spam)
+                # logger.debug(f"Tick {symbol}: {price}")
+    except Exception as e:
+        logger.error(f"Souscription interrompue : {e}")
+        # Tenter de relancer après un délai
+        await asyncio.sleep(5)
+        await subscribe_to_ticks(symbol)
+
+# ================== CALCUL RSI =======================
+def calculate_rsi(prices, window=14):
+    """Calcule le RSI à partir d'une liste de prix."""
+    if len(prices) < window + 1:
+        return None
+    deltas = np.diff(prices)
+    seed = deltas[:window+1]
+    up = seed[seed >= 0].sum()/window
+    down = -seed[seed < 0].sum()/window
+    if down == 0:
+        rs = 0
+    else:
+        rs = up/down
+    rsi = np.zeros_like(prices)
+    rsi[:window] = 100. - 100./(1.+rs)
+
+    for i in range(window, len(prices)):
+        delta = deltas[i-1]
+        if delta > 0:
+            upval = delta
+            downval = 0.
+        else:
+            upval = 0.
+            downval = -delta
+        up = (up*(window-1) + upval)/window
+        down = (down*(window-1) + downval)/window
+        if down == 0:
+            rs = 0
+        else:
+            rs = up/down
+        rsi[i] = 100. - 100./(1.+rs)
+    return rsi[-1]
+
+# ================== TRADE MULTIPLIER ==================
+async def place_multiplier_trade(symbol, amount, direction, sl_points, tp_points):
+    """
+    Passe un trade Multiplier sur Deriv.
+    direction: 'buy' pour hausse (CALL), 'sell' pour baisse (PUT)
+    amount: montant en USD (stake)
+    sl_points/tp_points: niveau de prix absolu pour stop loss et take profit.
+    """
+    if deriv_api is None:
+        return "❌ API Deriv non connectée"
+
+    # Récupérer le tick actuel pour avoir le prix exact
+    try:
+        tick_response = await deriv_api.ticks(symbol)
+        if 'tick' not in tick_response:
+            return "❌ Impossible de récupérer le prix"
+        current_price = tick_response['tick']['quote']  # mid price
+    except Exception as e:
+        return f"❌ Erreur tick: {e}"
+
+    # Déterminer le type de contrat et les barrières
+    contract_type = "CALL" if direction == "buy" else "PUT"
+    # Pour un Multiplier, le SL/TP sont des niveaux de prix absolus.
+    # On les calcule en pourcentage du prix actuel (points = variation absolue)
+    sl_price = round(current_price - sl_points, 5) if direction == "buy" else round(current_price + sl_points, 5)
+    tp_price = round(current_price + tp_points, 5) if direction == "buy" else round(current_price - tp_points, 5)
+
+    # Paramètres de l'ordre
+    proposal_params = {
+        "proposal": 1,
+        "amount": amount,
+        "basis": "stake",          # montant en USD
+        "contract_type": contract_type,
+        "currency": "USD",
+        "duration": 0,             # pas de durée pour Multiplier (run until close)
+        "duration_unit": "t",
+        "symbol": symbol,
+        "barrier": "0",            # requis mais ignoré pour Multiplier
+        "limit_order": {
+            "stop_loss": sl_price,
+            "take_profit": tp_price
+        },
+        "product_type": "multiplier"
+    }
+
+    # Obtenir une proposition (prix et contrat)
+    try:
+        proposal = await deriv_api.proposal(proposal_params)
+        if 'error' in proposal or 'proposal' not in proposal:
+            return f"❌ Erreur proposition : {proposal.get('error', {}).get('message', 'inconnue')}"
+        proposal_id = proposal['proposal']['id']
+        # La proposition contient un contrat qu'on peut acheter
+    except Exception as e:
+        return f"❌ Échec proposition : {e}"
+
+    # Acheter le contrat proposé
+    buy_params = {
+        "buy": proposal_id,
+        "price": 100.0  # Payer le montant (stake) correspondant
+    }
+    try:
+        buy_response = await deriv_api.buy(buy_params)
+        if 'error' in buy_response:
+            return f"❌ Échec achat : {buy_response['error']['message']}"
+        contract_id = buy_response['buy']['contract_id']
+        return f"✅ Trade Multiplier ouvert : ID {contract_id} | {direction.upper()} | Stake {amount} USD"
+    except Exception as e:
+        return f"❌ Erreur achat : {e}"
+
+# ================== FERMETURE DE POSITIONS ============
+async def close_all_positions(symbol):
+    """Ferme toutes les positions ouvertes sur un symbole."""
+    if deriv_api is None:
+        return "API non connectée"
+    try:
+        # Récupérer la liste des contrats ouverts
+        portfolio = await deriv_api.portfolio()
+        contracts = portfolio.get('portfolio', {}).get('contracts', [])
+        closed = []
+        for c in contracts:
+            if c['symbol'] == symbol and not c.get('is_sold'):
+                # Vendre le contrat
+                sell_response = await deriv_api.sell({"sell": c['contract_id'], "price": 0})
+                if 'error' not in sell_response:
+                    closed.append(c['contract_id'])
+        if closed:
+            return f"Fermé : {', '.join(map(str, closed))}"
+        else:
+            return "Aucune position ouverte"
+    except Exception as e:
+        return f"Erreur fermeture : {e}"
+
+# ================== IA TRADING LOOP ===================
+async def ai_trading_loop(context: ContextTypes.DEFAULT_TYPE):
+    global ai_running
+    chat_id = context.bot_data.get('chat_id')
+    if not chat_id:
+        await context.bot.send_message(chat_id=context.bot_data.get('chat_id'), text="Chat ID manquant")
+        return
+
+    ai_running = True
+    await context.bot.send_message(chat_id=chat_id, text="🤖 IA Deriv trading ON")
+
+    while ai_running:
+        try:
+            # Utiliser les prix du buffer pour le RSI
+            if len(prices_buffer) < RSI_PERIOD + 50:
+                await context.bot.send_message(chat_id=chat_id, text="⚠️ Attente de données de prix...")
+                await asyncio.sleep(10)
+                continue
+
+            rsi_val = calculate_rsi(np.array(prices_buffer), RSI_PERIOD)
+            if rsi_val is None:
+                await asyncio.sleep(10)
+                continue
+
+            # Logique de décision
+            decision = "HOLD"
+            if rsi_val < 30:
+                decision = "BUY"
+            elif rsi_val > 70:
+                decision = "SELL"
+
+            # Envoyer le signal
+            await context.bot.send_message(chat_id=chat_id, text=f"📊 RSI = {rsi_val:.2f} → Signal : {decision}")
+
+            # Exécution du trade si signal
+            if decision in ("BUY", "SELL"):
+                direction = "buy" if decision == "BUY" else "sell"
+                # Calculer SL/TP en valeur absolue
+                current_price = prices_buffer[-1]
+                sl_points = current_price * SL_MULTIPLIER_PCT
+                tp_points = current_price * TP_MULTIPLIER_PCT
+                result = await place_multiplier_trade(
+                    SYMBOL, DEFAULT_STAKE, direction, sl_points, tp_points
+                )
+                await context.bot.send_message(chat_id=chat_id, text=result)
+
+            # Attendre avant prochaine analyse
+            await asyncio.sleep(60)  # 1 minute
+
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Erreur boucle IA : {e}")
+            await asyncio.sleep(10)
+
+    await context.bot.send_message(chat_id=chat_id, text="🛑 IA trading OFF")
+
+# ================== COMMANDES TELEGRAM =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("⛔ Accès refusé.")
+        return
+    context.bot_data['chat_id'] = update.effective_chat.id
+    await update.message.reply_text(
+        "✅ Bot Deriv + IA opérationnel.\n"
+        "/start_ai - lancer IA automatique\n"
+        "/stop_ai - stopper IA\n"
+        "/buy STAKE [SL%] [TP%]\n"
+        "/sell STAKE [SL%] [TP%]\n"
+        "/close\n"
+        "/status"
+    )
+
+async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    try:
+        args = context.args
+        stake = float(args[0]) if len(args) >= 1 else DEFAULT_STAKE
+        sl_pct = float(args[1])/100 if len(args) >= 2 else SL_MULTIPLIER_PCT * 100  # on attend des %
+        tp_pct = float(args[2])/100 if len(args) >= 3 else TP_MULTIPLIER_PCT * 100
+        current_price = prices_buffer[-1] if prices_buffer else 1.0
+        sl_points = current_price * sl_pct
+        tp_points = current_price * tp_pct
+        result = await place_multiplier_trade(SYMBOL, stake, "buy", sl_points, tp_points)
+        await update.message.reply_text(result)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+
+async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    try:
+        args = context.args
+        stake = float(args[0]) if len(args) >= 1 else DEFAULT_STAKE
+        sl_pct = float(args[1])/100 if len(args) >= 2 else SL_MULTIPLIER_PCT * 100
+        tp_pct = float(args[2])/100 if len(args) >= 3 else TP_MULTIPLIER_PCT * 100
+        current_price = prices_buffer[-1] if prices_buffer else 1.0
+        sl_points = current_price * sl_pct
+        tp_points = current_price * tp_pct
+        result = await place_multiplier_trade(SYMBOL, stake, "sell", sl_points, tp_points)
+        await update.message.reply_text(result)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur : {e}")
+
+async def close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    result = await close_all_positions(SYMBOL)
+    await update.message.reply_text(result)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    # Récupérer les positions via portefeuille
+    if deriv_api:
+        try:
+            portfolio = await deriv_api.portfolio()
+            contracts = portfolio.get('portfolio', {}).get('contracts', [])
+            pos = [c for c in contracts if c['symbol'] == SYMBOL and not c.get('is_sold')]
+            if pos:
+                msg = f"📊 {len(pos)} position(s) sur {SYMBOL}:\n"
+                for p in pos:
+                    msg += f"- ID {p['contract_id']} | {p['contract_type']} | Stake {p['buy_price']} | Profit net {p.get('profit', 'N/A')}\n"
+            else:
+                msg = f"Aucune position sur {SYMBOL}"
+        except Exception as e:
+            msg = f"Erreur portefeuille : {e}"
+    else:
+        msg = "API Deriv non connectée"
+    await update.message.reply_text(msg)
+
+async def start_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    global ai_running, ai_task
+    if ai_running:
+        await update.message.reply_text("🤖 IA déjà en cours")
+        return
+    context.bot_data['chat_id'] = update.effective_chat.id
+    ai_task = asyncio.create_task(ai_trading_loop(context))
+    await update.message.reply_text("🤖 IA lancée")
+
+async def stop_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in AUTHORIZED_USERS: return
+    global ai_running, ai_task
+    if not ai_running:
+        await update.message.reply_text("🤖 IA déjà arrêtée")
+        return
+    ai_running = False
+    if ai_task:
+        ai_task.cancel()
+    await update.message.reply_text("🛑 Arrêt de l'IA demandé")
+
+# ================== MAIN ==========================================
+async def main():
+    # Connexion Deriv
+    if not await connect_deriv():
+        logger.error("Impossible de démarrer sans connexion Deriv")
+        return
+
+    # Lancer la souscription aux ticks en tâche de fond
+    asyncio.create_task(subscribe_to_ticks(SYMBOL))
+
+    # Telegram bot
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("buy", buy))
+    app.add_handler(CommandHandler("sell", sell))
+    app.add_handler(CommandHandler("close", close))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("start_ai", start_ai))
+    app.add_handler(CommandHandler("stop_ai", stop_ai))
+
+    logger.info("🤖 Bot Telegram + Deriv prêt...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
